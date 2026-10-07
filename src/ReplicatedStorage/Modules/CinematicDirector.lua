@@ -1,0 +1,558 @@
+--!strict
+-- CinematicDirector.lua
+-- ModuleScript at ReplicatedStorage > Modules > CinematicDirector
+--
+-- Plays a client-side camera sequence built from TrackKeyframes:
+-- camera blends between nodes while tracking a (possibly moving) subject,
+-- with letterbox bars, typewriter subtitles, an edge vignette, depth of
+-- field, optional sounds, FaceControls poses and hold-to-skip.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local SoundService = game:GetService("SoundService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+export type FacialState = {
+	HunterEyes: number?, -- 0..1 brow drop + lid squint
+	HollowCheeks: number?, -- 0..1 cheek/lip suck (approximated, see FACIAL_MAP)
+	MewingPosture: number?, -- 0..1 chin raise + lips pressed
+	Duration: number?, -- blend time in seconds
+}
+
+export type TrackKeyframe = {
+	PositionPart: BasePart, -- where the camera sits
+	LookAtPart: BasePart?, -- what the camera tracks; defaults to PositionPart's facing
+	Duration: number, -- seconds; the camera blends into the shot over this time
+	FOV: number?, -- nil keeps the previous shot's FOV
+	Roll: number?, -- degrees, default 0
+	Subtitle: string?,
+	VignetteIntensity: number?, -- 0..1, nil keeps the previous value
+	FocusDistance: number?, -- studs; nil disables depth of field for the shot
+	FocusRadius: number?, -- studs around FocusDistance kept sharp; defaults to FocusDistance
+	FacialState: FacialState?,
+	SoundId: string?,
+	CharacterMoveTarget: CFrame?, -- TargetCharacter walks here during the shot
+}
+
+export type DirectorOptions = {
+	AllowSkip: boolean?,
+	HoldSkipDuration: number?,
+	TargetCharacter: Model?,
+}
+
+local RENDER_STEP_NAME = "CinematicDirectorCamera"
+local LETTERBOX_HEIGHT = 0.1
+local LETTERBOX_TWEEN = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local SUBTITLE_TYPE_SPEED = 40 -- graphemes per second
+local VIGNETTE_DEPTH = 0.35 -- fraction of the screen each edge gradient covers
+
+-- FacialState control -> { FaceControls property = scale }. FaceControls has
+-- no lid-tightener or cheek-suck pose, so the squint is a partial eye close
+-- and HollowCheeks is approximated with a flat pucker and a lower-lip suck.
+local FACIAL_MAP: { [string]: { [string]: number } } = {
+	HunterEyes = { LeftBrowLowerer = 1, RightBrowLowerer = 1, LeftEyeClosed = 0.35, RightEyeClosed = 0.35 },
+	HollowCheeks = { FlatPucker = 1, LowerLipSuck = 1 },
+	MewingPosture = { ChinRaiser = 1, LipsTogether = 1 },
+}
+
+local CinematicDirector = {}
+CinematicDirector.__index = CinematicDirector
+
+type DirectorFields = {
+	_sequence: { TrackKeyframe },
+	_allowSkip: boolean,
+	_holdSkipDuration: number,
+	_character: Model?,
+	_state: "Idle" | "Playing" | "Done",
+	_stopped: boolean,
+	_connections: { RBXScriptConnection },
+	_instances: { Instance },
+	_restoreFace: { [string]: number },
+	_savedCamera: {
+		CameraType: Enum.CameraType,
+		CameraSubject: Instance?,
+		FieldOfView: number,
+	}?,
+	_controls: any,
+	_moved: boolean,
+	_vignette: number,
+	_gui: ScreenGui?,
+}
+
+export type CinematicDirector = typeof(setmetatable({} :: DirectorFields, CinematicDirector))
+
+local function lerp(a: number, b: number, t: number): number
+	return a + (b - a) * t
+end
+
+local function ease(alpha: number): number
+	return TweenService:GetValue(alpha, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+end
+
+local function getControls(): any
+	local playerScripts = Players.LocalPlayer:FindFirstChild("PlayerScripts")
+	local playerModule = playerScripts and playerScripts:FindFirstChild("PlayerModule")
+	if not playerModule or not playerModule:IsA("ModuleScript") then
+		return nil
+	end
+	local ok, module = pcall(require, playerModule)
+	if ok and type(module) == "table" and module.GetControls then
+		return module:GetControls()
+	end
+	return nil
+end
+
+function CinematicDirector.new(sequence: { TrackKeyframe }, options: DirectorOptions?): CinematicDirector
+	local opts: DirectorOptions = options or {}
+	local self: DirectorFields = {
+		_sequence = sequence,
+		_allowSkip = opts.AllowSkip == true,
+		_holdSkipDuration = opts.HoldSkipDuration or 1,
+		_character = opts.TargetCharacter,
+		_state = "Idle",
+		_stopped = false,
+		_connections = {},
+		_instances = {},
+		_restoreFace = {},
+		_savedCamera = nil,
+		_controls = nil,
+		_moved = false,
+		_vignette = 0,
+		_gui = nil,
+	}
+	return setmetatable(self, CinematicDirector)
+end
+
+-- Ends the cutscene early; Play() returns once cleanup has run.
+function CinematicDirector.Stop(self: CinematicDirector)
+	self._stopped = true
+end
+
+-- Yields until the sequence finishes or is stopped/skipped.
+function CinematicDirector.Play(self: CinematicDirector)
+	if self._state ~= "Idle" then
+		return
+	end
+	self._state = "Playing"
+
+	local ok, err = pcall(function()
+		self:_setup()
+		for _, keyframe in self._sequence do
+			if self._stopped then
+				break
+			end
+			self:_playShot(keyframe)
+		end
+	end)
+
+	self:_cleanup()
+	self._state = "Done"
+	if not ok then
+		error(err, 0)
+	end
+end
+
+function CinematicDirector._getHumanoid(self: CinematicDirector): Humanoid?
+	local character = self._character
+	return character and character:FindFirstChildOfClass("Humanoid")
+end
+
+function CinematicDirector._buildGui(self: CinematicDirector): ScreenGui
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "CinematicDirectorGui"
+	gui.IgnoreGuiInset = true
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 100
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local vignette = Instance.new("Frame")
+	vignette.Name = "Vignette"
+	vignette.BackgroundTransparency = 1
+	vignette.Size = UDim2.fromScale(1, 1)
+	vignette.Parent = gui
+
+	-- Four overlapping edge gradients: darker corners give a cheap vignette
+	-- without needing an image asset.
+	local edges = {
+		{ Name = "Top", Size = UDim2.fromScale(1, VIGNETTE_DEPTH), Position = UDim2.fromScale(0, 0), Rotation = 90 },
+		{ Name = "Bottom", Size = UDim2.fromScale(1, VIGNETTE_DEPTH), Position = UDim2.fromScale(0, 1 - VIGNETTE_DEPTH), Rotation = 270 },
+		{ Name = "Left", Size = UDim2.fromScale(VIGNETTE_DEPTH, 1), Position = UDim2.fromScale(0, 0), Rotation = 0 },
+		{ Name = "Right", Size = UDim2.fromScale(VIGNETTE_DEPTH, 1), Position = UDim2.fromScale(1 - VIGNETTE_DEPTH, 0), Rotation = 180 },
+	}
+	for _, edge in edges do
+		local frame = Instance.new("Frame")
+		frame.Name = edge.Name
+		frame.BackgroundColor3 = Color3.new(0, 0, 0)
+		frame.BorderSizePixel = 0
+		frame.Size = edge.Size
+		frame.Position = edge.Position
+		frame.Parent = vignette
+
+		local gradient = Instance.new("UIGradient")
+		gradient.Rotation = edge.Rotation
+		gradient.Transparency = NumberSequence.new(1)
+		gradient.Parent = frame
+	end
+
+	for _, name in { "TopBar", "BottomBar" } do
+		local bar = Instance.new("Frame")
+		bar.Name = name
+		bar.BackgroundColor3 = Color3.new(0, 0, 0)
+		bar.BorderSizePixel = 0
+		bar.Size = UDim2.fromScale(1, 0)
+		bar.AnchorPoint = if name == "TopBar" then Vector2.new(0, 0) else Vector2.new(0, 1)
+		bar.Position = if name == "TopBar" then UDim2.fromScale(0, 0) else UDim2.fromScale(0, 1)
+		bar.ZIndex = 2
+		bar.Parent = gui
+	end
+
+	local subtitle = Instance.new("TextLabel")
+	subtitle.Name = "Subtitle"
+	subtitle.BackgroundTransparency = 1
+	subtitle.AnchorPoint = Vector2.new(0.5, 0.5)
+	subtitle.Position = UDim2.fromScale(0.5, 1 - LETTERBOX_HEIGHT / 2)
+	subtitle.Size = UDim2.fromScale(0.8, LETTERBOX_HEIGHT * 0.6)
+	subtitle.Font = Enum.Font.GothamMedium
+	subtitle.TextColor3 = Color3.new(1, 1, 1)
+	subtitle.TextScaled = true
+	subtitle.Text = ""
+	subtitle.ZIndex = 3
+	subtitle.Parent = gui
+
+	local sizeConstraint = Instance.new("UITextSizeConstraint")
+	sizeConstraint.MaxTextSize = 28
+	sizeConstraint.Parent = subtitle
+
+	if self._allowSkip then
+		local skip = Instance.new("TextButton")
+		skip.Name = "SkipButton"
+		skip.AutoButtonColor = false
+		skip.AnchorPoint = Vector2.new(1, 0.5)
+		skip.Position = UDim2.new(1, -16, LETTERBOX_HEIGHT / 2, 0)
+		skip.Size = UDim2.fromOffset(150, 30)
+		skip.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+		skip.BackgroundTransparency = 0.3
+		skip.Font = Enum.Font.GothamMedium
+		skip.TextColor3 = Color3.new(1, 1, 1)
+		skip.TextSize = 14
+		skip.Text = if UserInputService.KeyboardEnabled then "Hold [Space] to skip" else "Hold to skip"
+		skip.ZIndex = 3
+		skip.Parent = gui
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 6)
+		corner.Parent = skip
+
+		local fill = Instance.new("Frame")
+		fill.Name = "Fill"
+		fill.BackgroundColor3 = Color3.new(1, 1, 1)
+		fill.BackgroundTransparency = 0.75
+		fill.BorderSizePixel = 0
+		fill.Size = UDim2.fromScale(0, 1)
+		fill.ZIndex = 2
+		fill.Parent = skip
+
+		local fillCorner = corner:Clone()
+		fillCorner.Parent = fill
+	end
+
+	gui.Parent = Players.LocalPlayer:WaitForChild("PlayerGui")
+	return gui
+end
+
+function CinematicDirector._setVignette(self: CinematicDirector, intensity: number)
+	self._vignette = intensity
+	local vignette = self._gui and self._gui:FindFirstChild("Vignette")
+	if not vignette then
+		return
+	end
+	local edgeTransparency = 1 - math.clamp(intensity, 0, 1)
+	local sequence = NumberSequence.new(edgeTransparency, 1)
+	for _, frame in vignette:GetChildren() do
+		local gradient = frame:FindFirstChildOfClass("UIGradient")
+		if gradient then
+			gradient.Transparency = sequence
+		end
+	end
+end
+
+function CinematicDirector._bindSkipInput(self: CinematicDirector)
+	local gui = self._gui
+	if not self._allowSkip or not gui then
+		return
+	end
+	local skipButton = gui:FindFirstChild("SkipButton") :: TextButton
+	local fill = skipButton:FindFirstChild("Fill") :: Frame
+
+	local keyHeld = false
+	local pointerHeld = false
+	local heldFor = 0
+
+	local function isSkipKey(input: InputObject): boolean
+		return input.KeyCode == Enum.KeyCode.Space or input.KeyCode == Enum.KeyCode.ButtonA
+	end
+	local function isPointer(input: InputObject): boolean
+		return input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch
+	end
+
+	table.insert(
+		self._connections,
+		UserInputService.InputBegan:Connect(function(input, gameProcessed)
+			if not gameProcessed and isSkipKey(input) then
+				keyHeld = true
+			end
+		end)
+	)
+	table.insert(
+		self._connections,
+		UserInputService.InputEnded:Connect(function(input)
+			if isSkipKey(input) then
+				keyHeld = false
+			elseif isPointer(input) then
+				pointerHeld = false
+			end
+		end)
+	)
+	table.insert(
+		self._connections,
+		skipButton.InputBegan:Connect(function(input)
+			if isPointer(input) then
+				pointerHeld = true
+			end
+		end)
+	)
+	table.insert(
+		self._connections,
+		RunService.Heartbeat:Connect(function(dt)
+			if keyHeld or pointerHeld then
+				heldFor += dt
+			else
+				heldFor = 0
+			end
+			fill.Size = UDim2.fromScale(math.clamp(heldFor / self._holdSkipDuration, 0, 1), 1)
+			if heldFor >= self._holdSkipDuration then
+				self:Stop()
+			end
+		end)
+	)
+end
+
+function CinematicDirector._setup(self: CinematicDirector)
+	local camera = Workspace.CurrentCamera
+	self._savedCamera = {
+		CameraType = camera.CameraType,
+		CameraSubject = camera.CameraSubject,
+		FieldOfView = camera.FieldOfView,
+	}
+	camera.CameraType = Enum.CameraType.Scriptable
+
+	self._controls = getControls()
+	if self._controls then
+		self._controls:Disable()
+	end
+
+	local humanoid = self:_getHumanoid()
+	if humanoid then
+		table.insert(
+			self._connections,
+			humanoid.Died:Connect(function()
+				self:Stop()
+			end)
+		)
+	end
+
+	local depthOfField = Instance.new("DepthOfFieldEffect")
+	depthOfField.Name = "CinematicDepthOfField"
+	depthOfField.Enabled = false
+	depthOfField.FarIntensity = 0.5
+	depthOfField.NearIntensity = 0.3
+	depthOfField.Parent = camera
+	table.insert(self._instances, depthOfField)
+
+	local gui = self:_buildGui()
+	self._gui = gui
+	table.insert(self._instances, gui)
+
+	for _, name in { "TopBar", "BottomBar" } do
+		local bar = gui:FindFirstChild(name) :: Frame
+		TweenService:Create(bar, LETTERBOX_TWEEN, { Size = UDim2.fromScale(1, LETTERBOX_HEIGHT) }):Play()
+	end
+
+	self:_bindSkipInput()
+end
+
+function CinematicDirector._applyFacialState(self: CinematicDirector, state: FacialState)
+	local character = self._character
+	local faceControls = character and character:FindFirstChildWhichIsA("FaceControls", true)
+	if not faceControls then
+		return -- classic heads have no FaceControls; skip silently
+	end
+
+	local goals: { [string]: number } = {}
+	for control, properties in FACIAL_MAP do
+		local weight = (state :: any)[control]
+		if type(weight) == "number" then
+			for property, scale in properties do
+				local ok, current = pcall(function()
+					return (faceControls :: any)[property]
+				end)
+				if ok and type(current) == "number" then
+					if self._restoreFace[property] == nil then
+						self._restoreFace[property] = current
+					end
+					goals[property] = math.clamp(weight * scale, 0, 1)
+				end
+			end
+		end
+	end
+
+	if next(goals) then
+		local info = TweenInfo.new(state.Duration or 0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+		TweenService:Create(faceControls, info, goals):Play()
+	end
+end
+
+function CinematicDirector._playSound(self: CinematicDirector, soundId: string)
+	local sound = Instance.new("Sound")
+	sound.SoundId = soundId
+	sound.Parent = SoundService
+	table.insert(self._instances, sound)
+	sound:Play()
+end
+
+function CinematicDirector._playShot(self: CinematicDirector, keyframe: TrackKeyframe)
+	local camera = Workspace.CurrentCamera
+	local gui = self._gui :: ScreenGui
+	local subtitle = gui:FindFirstChild("Subtitle") :: TextLabel
+	local depthOfField = camera:FindFirstChild("CinematicDepthOfField") :: DepthOfFieldEffect?
+
+	local fromCFrame = camera.CFrame
+	local fromFOV = camera.FieldOfView
+	local toFOV = keyframe.FOV or fromFOV
+	local roll = math.rad(keyframe.Roll or 0)
+	local fromVignette = self._vignette
+	local toVignette = keyframe.VignetteIntensity or fromVignette
+	local fromFocus = if depthOfField and depthOfField.Enabled then depthOfField.FocusDistance else keyframe.FocusDistance
+	local duration = math.max(keyframe.Duration, 0.05)
+
+	subtitle.Text = keyframe.Subtitle or ""
+	subtitle.MaxVisibleGraphemes = 0
+	local graphemeCount = utf8.len(subtitle.Text) or #subtitle.Text
+
+	if depthOfField then
+		depthOfField.Enabled = keyframe.FocusDistance ~= nil
+		if keyframe.FocusDistance then
+			depthOfField.InFocusRadius = keyframe.FocusRadius or keyframe.FocusDistance
+		end
+	end
+
+	if keyframe.FacialState then
+		self:_applyFacialState(keyframe.FacialState)
+	end
+	if keyframe.SoundId then
+		self:_playSound(keyframe.SoundId)
+	end
+	local humanoid = self:_getHumanoid()
+	if keyframe.CharacterMoveTarget and humanoid then
+		humanoid:MoveTo(keyframe.CharacterMoveTarget.Position)
+		self._moved = true
+	end
+
+	local elapsed = 0
+	RunService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value + 1, function(dt)
+		elapsed += dt
+		local alpha = ease(math.clamp(elapsed / duration, 0, 1))
+
+		local position = keyframe.PositionPart.Position
+		local target: CFrame
+		local lookAt = keyframe.LookAtPart
+		if lookAt and (lookAt.Position - position).Magnitude > 1e-3 then
+			target = CFrame.lookAt(position, lookAt.Position)
+		else
+			target = keyframe.PositionPart.CFrame
+		end
+		target *= CFrame.Angles(0, 0, roll)
+
+		camera.CFrame = fromCFrame:Lerp(target, alpha)
+		camera.FieldOfView = lerp(fromFOV, toFOV, alpha)
+
+		self:_setVignette(lerp(fromVignette, toVignette, alpha))
+
+		if depthOfField and keyframe.FocusDistance then
+			depthOfField.FocusDistance = lerp(fromFocus or keyframe.FocusDistance, keyframe.FocusDistance, alpha)
+		end
+
+		subtitle.MaxVisibleGraphemes = math.min(math.floor(elapsed * SUBTITLE_TYPE_SPEED), graphemeCount)
+	end)
+
+	local started = os.clock()
+	while not self._stopped and os.clock() - started < duration do
+		task.wait()
+	end
+	RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
+end
+
+function CinematicDirector._cleanup(self: CinematicDirector)
+	pcall(function()
+		RunService:UnbindFromRenderStep(RENDER_STEP_NAME)
+	end)
+
+	for _, connection in self._connections do
+		connection:Disconnect()
+	end
+	table.clear(self._connections)
+
+	local camera = Workspace.CurrentCamera
+	local humanoid = self:_getHumanoid()
+	local saved = self._savedCamera
+	if saved then
+		camera.CameraType = if saved.CameraType == Enum.CameraType.Scriptable
+			then Enum.CameraType.Custom
+			else saved.CameraType
+		camera.CameraSubject = humanoid or saved.CameraSubject
+		camera.FieldOfView = saved.FieldOfView
+	end
+
+	if self._controls then
+		self._controls:Enable()
+	end
+
+	if self._moved and humanoid and humanoid.RootPart then
+		-- Cancel any MoveTo still in progress (e.g. after a skip).
+		humanoid:MoveTo(humanoid.RootPart.Position)
+	end
+
+	local character = self._character
+	local faceControls = character and character:FindFirstChildWhichIsA("FaceControls", true)
+	if faceControls and next(self._restoreFace) then
+		TweenService:Create(faceControls, TweenInfo.new(0.4), self._restoreFace):Play()
+	end
+
+	local gui = self._gui
+	if gui then
+		for _, name in { "TopBar", "BottomBar" } do
+			local bar = gui:FindFirstChild(name) :: Frame
+			TweenService:Create(bar, LETTERBOX_TWEEN, { Size = UDim2.fromScale(1, 0) }):Play()
+		end
+		local subtitle = gui:FindFirstChild("Subtitle") :: TextLabel
+		subtitle.Text = ""
+		self:_setVignette(0)
+		local skip = gui:FindFirstChild("SkipButton")
+		if skip then
+			skip:Destroy()
+		end
+	end
+
+	local instances = self._instances
+	self._instances = {}
+	task.delay(LETTERBOX_TWEEN.Time, function()
+		for _, instance in instances do
+			instance:Destroy()
+		end
+	end)
+end
+
+return CinematicDirector
