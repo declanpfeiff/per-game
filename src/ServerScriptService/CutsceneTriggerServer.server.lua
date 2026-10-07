@@ -2,46 +2,70 @@
 -- CutsceneTriggerServer
 -- Script in ServerScriptService
 --
--- Tells a player's client to play the cutscene when they use the trigger's
--- ProximityPrompt, or (if the trigger part's TouchTrigger attribute is true)
--- when they step on it.
+-- Starts the cutscene for a player who uses the trigger's ProximityPrompt, or
+-- (if the pad's TouchTrigger attribute is true) steps on the pad. One player
+-- at a time: the cutscene moves them onto the pad, so a second player would
+-- share the mark. The prompt is hidden until the client reports it finished,
+-- the player leaves, or MaxDuration passes.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
-local playEvent = ReplicatedStorage:WaitForChild("RemoteEvents"):WaitForChild("PlayCutscene") :: RemoteEvent
+local remotes = ReplicatedStorage:WaitForChild("RemoteEvents")
+local playEvent = remotes:WaitForChild("PlayCutscene") :: RemoteEvent
+local finishedEvent = remotes:WaitForChild("CutsceneFinished") :: RemoteEvent
 local triggerPart = Workspace:WaitForChild("CutsceneTriggerPart") :: BasePart
 local prompt = triggerPart:WaitForChild("ProximityPrompt") :: ProximityPrompt
 
 local DEFAULT_COOLDOWN = 3
+local DEFAULT_MAX_DURATION = 45
 
--- Camera nodes stay visible in Studio for editing, but would float in the
--- middle of other shots in-game.
-for _, node in Workspace:WaitForChild("CutsceneNodes"):GetChildren() do
-	if node:IsA("BasePart") then
-		node.Transparency = 1
-	end
+local function numberAttribute(name: string, default: number): number
+	local value = triggerPart:GetAttribute(name)
+	return if type(value) == "number" then value else default
 end
 
--- Touched fires many times per step while a character walks on the part,
--- so every trigger goes through a per-player cooldown.
-local lastFired: { [Player]: number } = {}
+local activePlayer: Player? = nil
+local activeRun = 0
+-- Touched fires many times per step while a character walks on the pad,
+-- so triggers also go through a per-player cooldown, counted from when the
+-- player's last cutscene ended.
+local lastFinished: { [Player]: number } = {}
 
-local function fireFor(player: Player)
-	local attribute = triggerPart:GetAttribute("Cooldown")
-	local cooldown = if type(attribute) == "number" then attribute else DEFAULT_COOLDOWN
-
-	local now = os.clock()
-	local last = lastFired[player]
-	if last and now - last < cooldown then
+local function release(player: Player)
+	if activePlayer ~= player then
 		return
 	end
-	lastFired[player] = now
-	playEvent:FireClient(player)
+	activePlayer = nil
+	lastFinished[player] = os.clock()
+	prompt.Enabled = true
 end
 
-prompt.Triggered:Connect(fireFor)
+local function begin(player: Player)
+	if activePlayer then
+		return
+	end
+	local last = lastFinished[player]
+	if last and os.clock() - last < numberAttribute("Cooldown", DEFAULT_COOLDOWN) then
+		return
+	end
+
+	activePlayer = player
+	activeRun += 1
+	local run = activeRun
+	prompt.Enabled = false
+	playEvent:FireClient(player)
+
+	-- Safety net in case the client never reports back.
+	task.delay(numberAttribute("MaxDuration", DEFAULT_MAX_DURATION), function()
+		if activeRun == run then
+			release(player)
+		end
+	end)
+end
+
+prompt.Triggered:Connect(begin)
 
 triggerPart.Touched:Connect(function(otherPart: BasePart)
 	if triggerPart:GetAttribute("TouchTrigger") ~= true then
@@ -50,10 +74,13 @@ triggerPart.Touched:Connect(function(otherPart: BasePart)
 	local character = otherPart.Parent
 	local player = character and Players:GetPlayerFromCharacter(character)
 	if player then
-		fireFor(player)
+		begin(player)
 	end
 end)
 
+finishedEvent.OnServerEvent:Connect(release)
+
 Players.PlayerRemoving:Connect(function(player: Player)
-	lastFired[player] = nil
+	release(player)
+	lastFinished[player] = nil
 end)

@@ -1,16 +1,16 @@
 -- Cinematic Cutscene installer (template)
 --
--- tools/build_installer.py inlines each script source into the matching
--- placeholder string in SOURCES and writes installer/InstallCutscene.lua.
--- Edit this file or src/, then rebuild; don't edit the generated file by hand.
+-- tools/build.luau inlines each script source into the matching placeholder
+-- string in SOURCES and writes installer/InstallCutscene.lua. Edit this file
+-- or src/, then rebuild; don't edit the generated file by hand.
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local ServerScriptService = game:GetService("ServerScriptService")
 local StarterPlayer = game:GetService("StarterPlayer")
 local Workspace = game:GetService("Workspace")
 
--- Where the set is built. Offset from the world origin so the trigger pad
--- does not overlap the default SpawnLocation.
+-- Where the set is built. Offset from the world origin so it doesn't overlap
+-- the default SpawnLocation. The character faces -Z on the pad.
 local ORIGIN = Vector3.new(0, 0, -30)
 
 local SOURCES = {
@@ -41,40 +41,64 @@ local function replaceScript(parent: Instance, className: string, name: string, 
 	newScript.Parent = parent
 end
 
--- 1. Camera nodes (kept if they already exist, so Studio edits survive a re-run)
-local nodesFolder = ensure(Workspace, "Folder", "CutsceneNodes")
-local nodeLayout = {
-	{ Name = "CamNode1", Offset = Vector3.new(0, 12, 25), Color = Color3.fromRGB(255, 170, 0) },
-	{ Name = "CamNode2", Offset = Vector3.new(0, 6, 8), Color = Color3.fromRGB(0, 255, 170) },
-	{ Name = "CamNode3", Offset = Vector3.new(-10, 8, -15), Color = Color3.fromRGB(170, 0, 255) },
-}
-for _, layout in nodeLayout do
-	local node, created = ensure(nodesFolder, "Part", layout.Name)
-	if created then
-		local part = node :: Part
-		part.Size = Vector3.new(2, 2, 2)
-		part.Position = ORIGIN + layout.Offset
-		part.Anchored = true
-		part.CanCollide = false
-		part.CanTouch = false
-		part.CanQuery = false
-		part.CastShadow = false
-		part.Transparency = 0.5
-		part.Color = layout.Color
-	end
+local function block(parent: Instance, name: string, size: Vector3, offset: Vector3, color: Color3, material: Enum.Material): Part
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.Size = size
+	part.CFrame = CFrame.new(ORIGIN + offset)
+	part.Color = color
+	part.Material = material
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.Parent = parent
+	return part
 end
 
--- 2. Trigger pad with ProximityPrompt
+-- 1. The set (kept if it already exists, so Studio edits survive a re-run)
+local set, setCreated = ensure(Workspace, "Model", "CutsceneSet")
+if setCreated then
+	local concrete = Color3.fromRGB(55, 55, 62)
+	local accent = Color3.fromRGB(255, 60, 60)
+
+	block(set, "Floor", Vector3.new(26, 0.2, 34), Vector3.new(0, 0.1, -5), Color3.fromRGB(38, 38, 44), Enum.Material.Slate)
+
+	for _, x in { -9, 9 } do
+		for _, z in { 6, -6 } do
+			block(set, "Pillar", Vector3.new(2, 18, 2), Vector3.new(x, 9.2, z), concrete, Enum.Material.Concrete)
+			local inner = x - math.sign(x) * 1.15
+			local strip = block(set, "Strip", Vector3.new(0.3, 16, 0.3), Vector3.new(inner, 9.2, z), accent, Enum.Material.Neon)
+			strip.CastShadow = false
+			local light = Instance.new("PointLight")
+			light.Color = accent
+			light.Brightness = 1.2
+			light.Range = 10
+			light.Parent = strip
+		end
+	end
+
+	-- The doorway the character walks into at the end.
+	block(set, "DoorPost", Vector3.new(1.5, 13, 1.5), Vector3.new(-3.5, 6.7, -20), concrete, Enum.Material.Concrete)
+	block(set, "DoorPost", Vector3.new(1.5, 13, 1.5), Vector3.new(3.5, 6.7, -20), concrete, Enum.Material.Concrete)
+	block(set, "Lintel", Vector3.new(8.5, 1.5, 1.5), Vector3.new(0, 13.95, -20), concrete, Enum.Material.Concrete)
+	local void = block(set, "Shadow", Vector3.new(5.5, 13, 0.4), Vector3.new(0, 6.7, -20.6), Color3.new(0, 0, 0), Enum.Material.SmoothPlastic)
+	void.CastShadow = false
+	block(set, "BackWall", Vector3.new(40, 24, 1), Vector3.new(0, 12.2, -21.5), Color3.fromRGB(30, 30, 35), Enum.Material.Concrete)
+end
+
+-- 2. Trigger pad (the character's mark) with a ProximityPrompt
 local trigger, triggerCreated = ensure(Workspace, "Part", "CutsceneTriggerPart")
 if triggerCreated then
 	local part = trigger :: Part
-	part.Size = Vector3.new(4, 1, 4)
-	part.Position = ORIGIN + Vector3.new(0, 0.5, 0)
+	part.Size = Vector3.new(5, 0.4, 5)
+	part.CFrame = CFrame.new(ORIGIN + Vector3.new(0, 0.4, 0))
 	part.Anchored = true
 	part.Color = Color3.fromRGB(255, 50, 50)
 	part.Material = Enum.Material.Neon
+	part.TopSurface = Enum.SurfaceType.Smooth
 	part:SetAttribute("TouchTrigger", false)
 	part:SetAttribute("Cooldown", 3)
+	part:SetAttribute("MaxDuration", 45)
 end
 
 local prompt, promptCreated = ensure(trigger, "ProximityPrompt", "ProximityPrompt")
@@ -86,19 +110,23 @@ if promptCreated then
 	proximityPrompt.RequiresLineOfSight = false
 end
 
--- 3. RemoteEvent
+-- 3. RemoteEvents
 local remoteFolder = ensure(ReplicatedStorage, "Folder", "RemoteEvents")
 ensure(remoteFolder, "RemoteEvent", "PlayCutscene")
+ensure(remoteFolder, "RemoteEvent", "CutsceneFinished")
 
 -- 4. Scripts (always replaced, so a re-run picks up new code)
 local modulesFolder = ensure(ReplicatedStorage, "Folder", "Modules")
 replaceScript(modulesFolder, "ModuleScript", "CinematicDirector", SOURCES.CinematicDirector)
 replaceScript(ServerScriptService, "Script", "CutsceneTriggerServer", SOURCES.CutsceneTriggerServer)
 replaceScript(
-	StarterPlayer:WaitForChild("StarterPlayerScripts"),
+	ensure(StarterPlayer, "StarterPlayerScripts", "StarterPlayerScripts"),
 	"LocalScript",
 	"CutsceneClient",
 	SOURCES.CutsceneClient
 )
 
+if Workspace:FindFirstChild("CutsceneNodes") then
+	print("Workspace.CutsceneNodes is no longer used by the cutscene; delete it if you don't need it.")
+end
 print("✅ Cinematic cutscene installed. Press Play (F5), walk to the red pad and hold E.")

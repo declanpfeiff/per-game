@@ -1,0 +1,6 @@
+# Toolchain for building and testing (https://github.com/rojo-rbx/rokit).
+# Run `rokit install` to get these versions.
+[tools]
+lune = "lune-org/lune@0.10.5"
+rojo = "rojo-rbx/rojo@7.7.1"
+luau-lsp = "JohnnyMorganz/luau-lsp@1.70.1"

@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lune, Rojo and luau-lsp
+        run: |
+          mkdir -p "$HOME/tools" && cd "$HOME/tools"
+          curl -sSfL -o lune.zip https://github.com/lune-org/lune/releases/download/v0.10.5/lune-0.10.5-linux-x86_64.zip
+          curl -sSfL -o rojo.zip https://github.com/rojo-rbx/rojo/releases/download/v7.7.1/rojo-7.7.1-linux-x86_64.zip
+          curl -sSfL -o lsp.zip https://github.com/JohnnyMorganz/luau-lsp/releases/download/1.70.1/luau-lsp-linux-x86_64.zip
+          for archive in *.zip; do unzip -qo "$archive"; done
+          curl -sSfL -o roblox.d.luau https://raw.githubusercontent.com/JohnnyMorganz/luau-lsp/main/scripts/globalTypes.None.d.luau
+          echo "$HOME/tools" >> "$GITHUB_PATH"
+
+      - name: Installer is up to date
+        run: lune run tools/build --check
+
+      - name: Type-check (strict)
+        run: |
+          rojo sourcemap default.project.json -o sourcemap.json
+          luau-lsp analyze --platform=roblox --definitions=@roblox="$HOME/tools/roblox.d.luau" --sourcemap=sourcemap.json src
+
+      - name: Tests
+        run: lune run tests/run

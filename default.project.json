@@ -1,0 +1,35 @@
+{
+  "name": "CinematicCutscene",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Modules": {
+        "$className": "Folder",
+        "CinematicDirector": {
+          "$path": "src/ReplicatedStorage/Modules/CinematicDirector.lua"
+        }
+      },
+      "RemoteEvents": {
+        "$className": "Folder",
+        "PlayCutscene": {
+          "$className": "RemoteEvent"
+        },
+        "CutsceneFinished": {
+          "$className": "RemoteEvent"
+        }
+      }
+    },
+    "ServerScriptService": {
+      "CutsceneTriggerServer": {
+        "$path": "src/ServerScriptService/CutsceneTriggerServer.server.lua"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "CutsceneClient": {
+          "$path": "src/StarterPlayer/StarterPlayerScripts/CutsceneClient.client.lua"
+        }
+      }
+    }
+  }
+}
