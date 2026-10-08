@@ -126,6 +126,12 @@ cutscene ends, and `director:Stop()` ends it early.
   lighting) hasn't been seen on a real screen. The framing was checked by
   the tests below, not by eye.
 
+## 1969 Mustang model
+
+[`models/Mustang1969`](models/Mustang1969) has a 1969 Mustang SportsRoof
+(blue, white stripes) to import with Studio's 3D Importer, plus a Command Bar
+script that paints and assembles it. The README there has the steps.
+
 ## Development
 
 The scripts live in `src/`, and the installer and place file are generated
@@ -150,7 +156,10 @@ walk and die. The tests:
 - skip by key and by touch, check a short tap doesn't skip, and kill the
   character mid-shot;
 - check first person, and that a re-trigger while playing is ignored;
-- check the server's lock, cooldown, timeout, leaving and touch trigger.
+- check the server's lock, cooldown, timeout, leaving and touch trigger;
+- run the Mustang setup script on imports that are moved, turned around
+  at meter scale, or lying on their side, and check the paint,
+  orientation, length, grounding and welds.
 
 CI runs the build check, a strict type-check (luau-lsp with Roblox types)
 and the tests on every push.

@@ -1,10 +1,12 @@
 --!nocheck
--- Headless tests for the installer, server and client scripts.
+-- Headless tests for the installer, server and client scripts, and the
+-- Mustang's setup script.
 -- Run from the repository root:  lune run tests/run
 
 local fs = require("@lune/fs")
 local process = require("@lune/process")
 local roblox = require("@lune/roblox")
+local serde = require("@lune/serde")
 local Engine = require("./engine")
 
 local Vector3, Enum = roblox.Vector3, roblox.Enum
@@ -483,6 +485,153 @@ test("touch trigger is off by default and works when enabled", function()
 	end
 	ctx.engine:step(DT)
 	check(#ctx.engine.firedToClients == 1, "expected exactly one start from repeated touches, got %d", #ctx.engine.firedToClients)
+end)
+
+-- Mustang setup script ---------------------------------------------------------
+
+local CFrame = roblox.CFrame
+local MUSTANG_SETUP = fs.readFile("models/Mustang1969/SetupMustang.lua")
+local MUSTANG_PARTS = serde.decode("json", fs.readFile("models/Mustang1969/Mustang1969.parts.json"))
+local MUSTANG_LENGTH = 17.4
+local PAINT = roblox.Color3.fromRGB(33, 76, 156)
+
+-- The model the 3D Importer makes from the file (one MeshPart per mesh, in
+-- the file's layout), placed by `placement` and scaled by `scale`, over a
+-- baseplate whose top is at Y = 0.
+local function importMustang(engine, placement, scale: number)
+	local workspace = engine:service("Workspace")
+	local baseplate = engine:new("Part")
+	baseplate.Name = "Baseplate"
+	baseplate.Anchored = true
+	baseplate.Size = Vector3.new(512, 4, 512)
+	baseplate.CFrame = CFrame.new(0, -2, 0)
+	baseplate.Parent = workspace
+	local model = engine:new("Model")
+	model.Name = "Mustang1969"
+	model.Parent = workspace
+	for _, entry in MUSTANG_PARTS do
+		local part = engine:new("MeshPart")
+		part.Name = entry.name
+		part.Size = Vector3.new(entry.size[1], entry.size[2], entry.size[3]) * scale
+		part.CFrame = placement * CFrame.new(Vector3.new(entry.center[1], entry.center[2], entry.center[3]) * scale)
+		part.Parent = model
+	end
+	return model
+end
+
+local function runSetup(engine)
+	engine.privileged = true -- the Command Bar runs with plugin security
+	engine:runScript(nil, MUSTANG_SETUP)
+	engine.privileged = false
+	check(#engine.errors == 0, "setup failed:\n%s", table.concat(engine.errors, "\n"))
+end
+
+local function partsOf(model)
+	local parts = {}
+	for _, d in model:GetDescendants() do
+		if d:IsA("BasePart") then
+			table.insert(parts, d)
+		end
+	end
+	return parts
+end
+
+local function centroidOf(model, prefix: string)
+	local sum, count = Vector3.zero, 0
+	for _, part in partsOf(model) do
+		if part.Name:sub(1, #prefix) == prefix then
+			sum += part.Position
+			count += 1
+		end
+	end
+	return sum / count
+end
+
+local function extentOf(model, axis)
+	local low, high = math.huge, -math.huge
+	for _, part in partsOf(model) do
+		local cf, half = part.CFrame, part.Size / 2
+		local reach = math.abs(cf.RightVector:Dot(axis)) * half.X
+			+ math.abs(cf.UpVector:Dot(axis)) * half.Y
+			+ math.abs(cf.LookVector:Dot(axis)) * half.Z
+		low = math.min(low, cf.Position:Dot(axis) - reach)
+		high = math.max(high, cf.Position:Dot(axis) + reach)
+	end
+	return low, high
+end
+
+local function checkAssembled(engine, model)
+	local parts = partsOf(model)
+	local pivot = model:GetPivot()
+	local front = (centroidOf(model, "Headlights") - centroidOf(model, "Lamps_Red")).Unit
+	check(front:Dot(pivot.LookVector) > 0.999, "the LookVector isn't the car's front")
+	check(pivot.UpVector:Dot(Vector3.new(0, 1, 0)) > 0.999, "not upright")
+	check(centroidOf(model, "Glass").Y > centroidOf(model, "Tire").Y, "upside down")
+	local low, high = extentOf(model, pivot.LookVector)
+	check(near(high - low, MUSTANG_LENGTH, 0.01), "length %.3f, expected %.1f", high - low, MUSTANG_LENGTH)
+	local bottom = extentOf(model, Vector3.new(0, 1, 0))
+	check(near(bottom, 0, 0.01), "not resting on the baseplate (bottom at %.3f)", bottom)
+
+	local primary = model.PrimaryPart
+	check(primary and primary.Name:sub(1, 5) == "Body_", "PrimaryPart should be a body panel")
+	local welds = 0
+	for _, part in parts do
+		check(part.Anchored, "%s not anchored", part.Name)
+		check(part.Color ~= roblox.Color3.new(), "%s left unpainted", part.Name)
+		for _, child in part:GetChildren() do
+			if child:IsA("WeldConstraint") then
+				check(child.Part0 == primary and child.Part1 == part, "%s welded to the wrong part", part.Name)
+				welds += 1
+			end
+		end
+	end
+	check(welds == #parts - 1, "expected %d welds, got %d", #parts - 1, welds)
+	check(#engine.warnings == 0, "warnings: %s", table.concat(engine.warnings, "; "))
+end
+
+test("mustang: paints every part by name", function()
+	local engine = Engine.create()
+	local model = importMustang(engine, CFrame.new(20, 5, -40), 1)
+	runSetup(engine)
+	checkAssembled(engine, model)
+	local byName = {}
+	for _, part in partsOf(model) do
+		byName[part.Name] = part
+	end
+	check(#partsOf(model) == #MUSTANG_PARTS, "parts went missing")
+	check(byName.Body_1.Color == PAINT and byName.Body_2.Color == PAINT, "body isn't blue")
+	check(byName.Stripes.Color.R > 0.9, "stripes aren't white")
+	check(byName.Glass.Material == Enum.Material.Glass and near(byName.Glass.Transparency, 0.45), "glass")
+	check(byName.TireLetters_RF.Color.R > 0.9 and byName.Tire_RF.Color.R < 0.2, "tire letters matched as tire")
+	check(byName.RimChrome_LR.Reflectance > byName.Rim_LR.Reflectance, "rim chrome matched as rim")
+	check(byName.PlateBorders.Color.R > byName.PlateBorders.Color.G * 4, "plate border isn't red")
+	check(byName.Tire_LF.CanCollide and byName.Body_2.CanCollide, "body and tires should collide")
+	check(not byName.Trim_Chrome.CanCollide and not byName.Interior.CanCollide, "trim shouldn't collide")
+end)
+
+test("mustang: rights a turned-around import at meter scale", function()
+	local engine = Engine.create()
+	-- What you'd get if the importer read studs as meters (x3.57) and faced the car +Z.
+	local model = importMustang(engine, CFrame.new(-30, 12, 10) * CFrame.Angles(0, math.pi, 0), 1 / 0.28)
+	runSetup(engine)
+	checkAssembled(engine, model)
+end)
+
+test("mustang: stands up a car imported on its side, found through the selection", function()
+	local engine = Engine.create()
+	local model = importMustang(engine, CFrame.new(5, 30, 5) * CFrame.Angles(math.pi / 2, 0, 0.3), 1)
+	model.Name = "Imported"
+	engine:service("Selection"):Set({ model:FindFirstChild("Glass") })
+	runSetup(engine)
+	checkAssembled(engine, model)
+end)
+
+test("mustang: running the setup twice doesn't stack welds", function()
+	local engine = Engine.create()
+	local model = importMustang(engine, CFrame.new(0, 2, 0), 1)
+	runSetup(engine)
+	runSetup(engine)
+	checkAssembled(engine, model)
 end)
 
 -- Runner -------------------------------------------------------------------

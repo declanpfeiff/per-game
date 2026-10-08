@@ -201,6 +201,9 @@ InstanceMT.__index = function(self, key)
 	if key == "Position" and table.find(classChain(data.className), "BasePart") then
 		return self.CFrame.Position -- derived from CFrame, as in the engine
 	end
+	if key == "WorldPivot" and data.className == "Model" then
+		return self:GetPivot()
+	end
 	for _, class in classChain(data.className) do
 		local classMethods = data.engine.methods[class]
 		if classMethods and classMethods[key] then
@@ -245,6 +248,17 @@ InstanceMT.__newindex = function(self, key, value)
 	if key == "Position" and table.find(classChain(data.className), "BasePart") then
 		assert(typeof(value) == "Vector3", "bad value for Position")
 		self.CFrame = self.CFrame.Rotation + value
+		return
+	end
+	if key == "WorldPivot" and data.className == "Model" then
+		-- With a PrimaryPart the pivot is stored as the part's PivotOffset.
+		assert(typeof(value) == "CFrame", "bad value for WorldPivot")
+		local primary = data.props.PrimaryPart
+		if primary then
+			primary.PivotOffset = primary.CFrame:Inverse() * value
+		else
+			data.props.WorldPivot = value
+		end
 		return
 	end
 	local property = findProperty(data.className, key)
@@ -801,17 +815,80 @@ function Engine:_buildMethods()
 		},
 		Model = {
 			PivotTo = function(self, target)
-				local primary = self.PrimaryPart
-				assert(primary, "PivotTo on a model without a PrimaryPart")
-				local delta = target * primary.CFrame:Inverse()
+				assert(typeof(target) == "CFrame", "PivotTo expects a CFrame")
+				local delta = target * self:GetPivot():Inverse()
 				for _, part in descendants(self, {}) do
 					if isA(part, "BasePart") then
 						part.CFrame = delta * part.CFrame
 					end
 				end
+				if not self.PrimaryPart then
+					internals[self].props.WorldPivot = target
+				end
 			end,
 			GetPivot = function(self)
-				return self.PrimaryPart.CFrame
+				local primary = self.PrimaryPart
+				if primary then
+					return primary.CFrame * primary.PivotOffset
+				end
+				return internals[self].props.WorldPivot or roblox.CFrame.new()
+			end,
+			GetScale = function(self)
+				return internals[self].scale or 1
+			end,
+			-- Scales parts about the pivot, which stays put.
+			ScaleTo = function(self, scale: number)
+				assert(type(scale) == "number" and scale > 0, "ScaleTo expects a positive number")
+				local factor = scale / (internals[self].scale or 1)
+				local pivot = self:GetPivot()
+				for _, part in descendants(self, {}) do
+					if isA(part, "BasePart") then
+						local relative = pivot:Inverse() * part.CFrame
+						part.CFrame = pivot * (relative.Rotation + relative.Position * factor)
+						part.Size *= factor
+						part.PivotOffset = part.PivotOffset.Rotation + part.PivotOffset.Position * factor
+					end
+				end
+				internals[self].scale = scale
+			end,
+		},
+		Workspace = {
+			-- Nearest part (as a box) along the ray, honouring an Exclude filter.
+			Raycast = function(self, origin, direction, params)
+				local excluded = {}
+				if params and params.FilterType == roblox.Enum.RaycastFilterType.Exclude then
+					for _, root in params.FilterDescendantsInstances do
+						excluded[root] = true
+						for _, d in descendants(root, {}) do
+							excluded[d] = true
+						end
+					end
+				end
+				local best
+				for _, part in descendants(self, {}) do
+					if isA(part, "BasePart") and not excluded[part] then
+						local t = Engine.rayBox(part, origin, direction)
+						if t and (not best or t < best.t) then
+							best = { t = t, part = part }
+						end
+					end
+				end
+				if not best then
+					return nil
+				end
+				return {
+					Instance = best.part,
+					Position = origin + direction * best.t,
+					Distance = direction.Magnitude * best.t,
+				}
+			end,
+		},
+		Selection = {
+			Get = function()
+				return table.clone(engine.selection or {})
+			end,
+			Set = function(_, list)
+				engine.selection = table.clone(list)
 			end,
 		},
 		Humanoid = {
@@ -929,6 +1006,11 @@ function Engine:environment(script)
 		},
 		CFrame = CFrameShim,
 		TweenInfo = TweenInfoShim,
+		RaycastParams = {
+			new = function()
+				return { FilterType = roblox.Enum.RaycastFilterType.Exclude, FilterDescendantsInstances = {} }
+			end,
+		},
 		Vector3 = roblox.Vector3,
 		Vector2 = roblox.Vector2,
 		Color3 = roblox.Color3,
@@ -996,6 +1078,31 @@ function Engine:input(began: boolean, fields)
 end
 
 -- Geometry helpers for framing checks ---------------------------------------
+
+-- Fraction (0..1) along origin + direction where the ray enters a part's box, if it does.
+function Engine.rayBox(part, origin: Vector3, direction: Vector3): number?
+	local cf = part.CFrame
+	local o = cf:PointToObjectSpace(origin)
+	local d = cf:VectorToObjectSpace(direction)
+	local half = part.Size / 2
+	local enter, exit = 0, 1
+	for _, axis in { "X", "Y", "Z" } do
+		local oa, da, ha = o[axis], d[axis], half[axis]
+		if math.abs(da) < 1e-9 then
+			if math.abs(oa) > ha then
+				return nil
+			end
+		else
+			local t1, t2 = (-ha - oa) / da, (ha - oa) / da
+			enter = math.max(enter, math.min(t1, t2))
+			exit = math.min(exit, math.max(t1, t2))
+			if enter > exit then
+				return nil
+			end
+		end
+	end
+	return enter
+end
 
 -- Is a world point inside a part's box (grown by `margin` studs)?
 function Engine.pointInPart(part, point: Vector3, margin: number?): boolean

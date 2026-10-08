@@ -26,7 +26,7 @@ jobs:
       - name: Type-check (strict)
         run: |
           rojo sourcemap default.project.json -o sourcemap.json
-          luau-lsp analyze --platform=roblox --definitions=@roblox="$HOME/tools/roblox.d.luau" --sourcemap=sourcemap.json src
+          luau-lsp analyze --platform=roblox --definitions=@roblox="$HOME/tools/roblox.d.luau" --sourcemap=sourcemap.json src models/Mustang1969/SetupMustang.lua
 
       - name: Tests
         run: lune run tests/run
